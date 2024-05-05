@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from contextlib import contextmanager
 
 from torch.optim.lr_scheduler import LambdaLR
-
+import numpy as np
 from taming.modules.vqvae.quantize import VectorQuantizer2 as VectorQuantizer
 
 from ldm.modules.diffusionmodules.model import Encoder, Decoder

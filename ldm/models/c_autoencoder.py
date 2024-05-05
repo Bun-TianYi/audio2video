@@ -1,445 +1,341 @@
+__author__ = "Xinqiang Ding <xqding@umich.edu>"
+__date__ = "2018/12/17 18:05:21"
+
+import numpy as np
 import torch
-import pytorch_lightning as pl
+import torch.nn as nn
 import torch.nn.functional as F
-from contextlib import contextmanager
-
-from torch.optim.lr_scheduler import LambdaLR
-
-from taming.modules.vqvae.quantize import VectorQuantizer2 as VectorQuantizer
-
-from ldm.modules.diffusionmodules.model import Encoder, Decoder
-from ldm.modules.distributions.distributions import DiagonalGaussianDistribution
-
-from ldm.util import instantiate_from_config
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import pytorch_lightning as pl
+# from ldm.modules.diffusionmodules.model import Encoder, Decoder
+from einops import rearrange
 
 
-class VQModel(pl.LightningModule):
+class DBlock(nn.Module):
+    """ A basie building block for parametralize a normal distribution.
+    It is corresponding to the D operation in the reference Appendix.
+    """
+
+    def __init__(self, input_size, hidden_size, output_size):
+        super(DBlock, self).__init__()
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.output_size = output_size
+
+        self.fc1 = nn.Linear(input_size, hidden_size)
+        self.fc2 = nn.Linear(input_size, hidden_size)
+        self.fc_mu = nn.Linear(hidden_size, output_size)
+        self.fc_logsigma = nn.Linear(hidden_size, output_size)
+
+    def forward(self, input):
+        t = torch.tanh(self.fc1(input))
+        t = t * torch.sigmoid(self.fc2(input))
+        mu = self.fc_mu(t)
+        logsigma = self.fc_logsigma(t)
+        return mu, logsigma
+
+
+class PreProcess(nn.Module):
+    """ The pre-process layer for MNIST image
+
+    """
+
+    def __init__(self, input_size, processed_x_size):
+        super(PreProcess, self).__init__()
+        self.input_size = input_size
+        self.fc1 = nn.Linear(input_size, processed_x_size)
+        self.fc2 = nn.Linear(processed_x_size, processed_x_size)
+
+    def forward(self, input):
+        t = torch.relu(self.fc1(input))
+        t = torch.relu(self.fc2(t))
+        return t
+
+
+class Decoder(nn.Module):
+    """ The decoder layer converting state to observation.
+    Because the observation is MNIST image whose elements are values
+    between 0 and 1, the output of this layer are probabilities of
+    elements being 1.
+    """
+
+    def __init__(self, z_size, hidden_size, x_size):
+        super(Decoder, self).__init__()
+        self.fc1 = nn.Linear(z_size, hidden_size)
+        self.fc2 = nn.Linear(hidden_size, hidden_size)
+        self.fc3 = nn.Linear(hidden_size, x_size)
+
+    def forward(self, z):
+        t = torch.tanh(self.fc1(z))
+        t = torch.tanh(self.fc2(t))
+        p = torch.sigmoid(self.fc3(t))
+        return p
+
+
+class C_Encoder(nn.Module):
+    def __init__(self, in_channels, layer_num=2):
+        super(C_Encoder, self).__init__()
+        self.embeds = nn.ModuleList()
+        # 对数据进行一次embed
+        for i in range(layer_num):
+            layer = nn.Sequential(
+                nn.Conv1d(in_channels,
+                                     in_channels,
+                                     kernel_size=3,
+                                     stride=1,
+                                     padding=1),
+                    nn.GroupNorm(2, in_channels),
+                    nn.LeakyReLU())
+            self.embeds.append(layer)
+
+        # 对数据进行一次降采样
+        self.down_sample = nn.MaxPool1d(kernel_size=3, stride=2, padding=1)
+
+    def forward(self, x):
+        for embed in self.embeds:
+            x = embed(x)
+        x = self.down_sample(x)
+        return x
+
+class TD_VAE(pl.LightningModule):
+    """ The full TD_VAE model with jumpy prediction.
+
+    First, let's first go through some definitions which would help
+    understanding what is going on in the following code.
+
+    Belief: As the model is feed a sequence of observations, x_t, the
+      model updates its belief state, b_t, through a LSTM network. It
+      is a deterministic function of x_t. We call b_t the belief at
+      time t instead of belief state, becuase we call the hidden state z
+      state.
+
+    State: The latent state variable, z.
+
+    Observation: The observated variable, x. In this case, it represents
+      binarized MNIST images
+
+    """
+
     def __init__(self,
-                 ddconfig,
-                 lossconfig,
-                 n_embed,
-                 embed_dim,
-                 ckpt_path=None,
-                 ignore_keys=[],
-                 image_key="image",
-                 colorize_nlabels=None,
+                 input_size,
+                 processed_x_size,
+                 belief_state_size,
+                 state_size,
+                 batch_key=None,
+                 condition_key=None,
                  monitor=None,
-                 batch_resize_range=None,
-                 scheduler_config=None,
-                 lr_g_factor=1.0,
-                 remap=None,
-                 sane_index_shape=False, # tell vector quantizer to return indices as bhw
-                 use_ema=False
+                 ckpt_path=None,
                  ):
-        super().__init__()
-        self.embed_dim = embed_dim
-        self.n_embed = n_embed
-        self.image_key = image_key
-        self.encoder = Encoder(**ddconfig)
-        self.decoder = Decoder(**ddconfig)
-        self.loss = instantiate_from_config(lossconfig)
-        self.quantize = VectorQuantizer(n_embed, embed_dim, beta=0.25,
-                                        remap=remap,
-                                        sane_index_shape=sane_index_shape)
-        self.quant_conv = torch.nn.Conv2d(ddconfig["z_channels"], embed_dim, 1)
-        self.post_quant_conv = torch.nn.Conv2d(embed_dim, ddconfig["z_channels"], 1)
-        if colorize_nlabels is not None:
-            assert type(colorize_nlabels)==int
-            self.register_buffer("colorize", torch.randn(3, colorize_nlabels, 1, 1))
+        super(TD_VAE, self).__init__()
+        self.c_encode = C_Encoder(1024)
+        self.batch_key = batch_key
+        self.condition_key = condition_key
+        self.x_size = input_size
+        self.processed_x_size = processed_x_size
+        self.b_size = belief_state_size
+        self.z_size = state_size
         if monitor is not None:
             self.monitor = monitor
-        self.batch_resize_range = batch_resize_range
-        if self.batch_resize_range is not None:
-            print(f"{self.__class__.__name__}: Using per-batch resizing in range {batch_resize_range}.")
+        self.ckpt_path = ckpt_path
+        ## input pre-process layer
+        self.process_x = PreProcess(self.x_size, self.processed_x_size)
 
-        self.use_ema = use_ema
-        if self.use_ema:
-            self.model_ema = LitEma(self)
-            print(f"Keeping EMAs of {len(list(self.model_ema.buffers()))}.")
+        ## one layer LSTM for aggregating belief states
+        ## One layer LSTM is used here and I am not sure how many layers
+        ## are used in the original paper from the paper.
+        self.lstm = nn.LSTM(input_size=self.processed_x_size,
+                            hidden_size=self.b_size,
+                            batch_first=True)
 
-        if ckpt_path is not None:
-            self.init_from_ckpt(ckpt_path, ignore_keys=ignore_keys)
-        self.scheduler_config = scheduler_config
-        self.lr_g_factor = lr_g_factor
+        ## Two layer state model is used. Sampling is done by sampling
+        ## higher layer first.
+        ## belief to state (b to z)
+        ## (this is corresponding to P_B distribution in the reference;
+        ## weights are shared across time but not across layers.)
+        self.l2_b_to_z = DBlock(self.b_size, 50, self.z_size)  # layer 2
+        self.l1_b_to_z = DBlock(self.b_size + self.z_size, 50, self.z_size)  # layer 1
 
-    @contextmanager
-    def ema_scope(self, context=None):
-        if self.use_ema:
-            self.model_ema.store(self.parameters())
-            self.model_ema.copy_to(self)
-            if context is not None:
-                print(f"{context}: Switched to EMA weights")
-        try:
-            yield None
-        finally:
-            if self.use_ema:
-                self.model_ema.restore(self.parameters())
-                if context is not None:
-                    print(f"{context}: Restored training weights")
+        ## Given belief and state at time t2, infer the state at time t1
+        ## infer state
+        self.l2_infer_z = DBlock(self.b_size + 2 * self.z_size, 50, self.z_size)  # layer 2
+        self.l1_infer_z = DBlock(self.b_size + 2 * self.z_size + self.z_size, 50, self.z_size)  # layer 1
 
-    def init_from_ckpt(self, path, ignore_keys=list()):
-        sd = torch.load(path, map_location="cpu")["state_dict"]
-        keys = list(sd.keys())
-        for k in keys:
-            for ik in ignore_keys:
-                if k.startswith(ik):
-                    print("Deleting key {} from state_dict.".format(k))
-                    del sd[k]
-        missing, unexpected = self.load_state_dict(sd, strict=False)
-        print(f"Restored from {path} with {len(missing)} missing and {len(unexpected)} unexpected keys")
-        if len(missing) > 0:
-            print(f"Missing Keys: {missing}")
-            print(f"Unexpected Keys: {unexpected}")
+        ## Given the state at time t1, model state at time t2 through state transition
+        ## state transition
+        self.l2_transition_z = DBlock(2 * self.z_size, 50, self.z_size)
+        self.l1_transition_z = DBlock(2 * self.z_size + self.z_size, 50, self.z_size)
 
-    def on_train_batch_end(self, *args, **kwargs):
-        if self.use_ema:
-            self.model_ema(self)
+        ## state to observation
+        self.z_to_x = Decoder(2 * self.z_size, 200, self.x_size)
 
-    def encode(self, x):
-        h = self.encoder(x)
-        h = self.quant_conv(h)
-        quant, emb_loss, info = self.quantize(h)
-        return quant, emb_loss, info
+    def forward(self, lms, condition):
+        self.batch_size = lms.size()[0]
+        self.x = lms
+        ## pre-precess image x
+        self.processed_x = self.process_x(self.x)
 
-    def encode_to_prequant(self, x):
-        h = self.encoder(x)
-        h = self.quant_conv(h)
-        return h
+        ## aggregate the belief b
+        self.b, (h_n, c_n) = self.lstm(self.processed_x)
 
-    def decode(self, quant):
-        quant = self.post_quant_conv(quant)
-        dec = self.decoder(quant)
-        return dec
+    def calculate_loss(self, t1, t2):
+        """ Calculate the jumpy VD-VAE loss, which is corresponding to
+        the equation (6) and equation (8) in the reference.
 
-    def decode_code(self, code_b):
-        quant_b = self.quantize.embed_code(code_b)
-        dec = self.decode(quant_b)
-        return dec
+        """
 
-    def forward(self, input, return_pred_indices=False):
-        quant, diff, (_,_,ind) = self.encode(input)
-        dec = self.decode(quant)
-        if return_pred_indices:
-            return dec, diff, ind
-        return dec, diff
+        ## Because the loss is based on variational inference, we need to
+        ## draw samples from the variational distribution in order to estimate
+        ## the loss function.
 
-    def get_input(self, batch, k):
-        x = batch[k]
-        if len(x.shape) == 3:
-            x = x[..., None]
-        x = x.permute(0, 3, 1, 2).to(memory_format=torch.contiguous_format).float()
-        if self.batch_resize_range is not None:
-            lower_size = self.batch_resize_range[0]
-            upper_size = self.batch_resize_range[1]
-            if self.global_step <= 4:
-                # do the first few batches with max size to avoid later oom
-                new_resize = upper_size
-            else:
-                new_resize = np.random.choice(np.arange(lower_size, upper_size+16, 16))
-            if new_resize != x.shape[2]:
-                x = F.interpolate(x, size=new_resize, mode="bicubic")
-            x = x.detach()
-        return x
+        ## sample a state at time t2 (see the reparametralization trick is used)
+        ## z in layer 2
+        t2_l2_z_mu, t2_l2_z_logsigma = self.l2_b_to_z(self.b[:, t2, :])
+        t2_l2_z_epsilon = torch.randn_like(t2_l2_z_mu)  # 返回一个与均值张量相同尺寸的矩阵，元素为由标准正态分布采样出来的值
+        t2_l2_z = t2_l2_z_mu + torch.exp(t2_l2_z_logsigma) * t2_l2_z_epsilon
 
-    def training_step(self, batch, batch_idx, optimizer_idx):
-        # https://github.com/pytorch/pytorch/issues/37142
-        # try not to fool the heuristics
-        x = self.get_input(batch, self.image_key)
-        xrec, qloss, ind = self(x, return_pred_indices=True)
+        ## z in layer 1
+        t2_l1_z_mu, t2_l1_z_logsigma = self.l1_b_to_z(
+            torch.cat((self.b[:, t2, :], t2_l2_z), dim=-1))
+        t2_l1_z_epsilon = torch.randn_like(t2_l1_z_mu)
+        t2_l1_z = t2_l1_z_mu + torch.exp(t2_l1_z_logsigma) * t2_l1_z_epsilon
 
-        if optimizer_idx == 0:
-            # autoencode
-            aeloss, log_dict_ae = self.loss(qloss, x, xrec, optimizer_idx, self.global_step,
-                                            last_layer=self.get_last_layer(), split="train",
-                                            predicted_indices=ind)
+        ## concatenate z from layer 1 and layer 2
+        t2_z = torch.cat((t2_l1_z, t2_l2_z), dim=-1)
 
-            self.log_dict(log_dict_ae, prog_bar=False, logger=True, on_step=True, on_epoch=True)
-            return aeloss
+        ## sample a state at time t1
+        ## infer state at time t1 based on states at time t2
+        t1_l2_qs_z_mu, t1_l2_qs_z_logsigma = self.l2_infer_z(
+            torch.cat((self.b[:, t1, :], t2_z), dim=-1))
+        t1_l2_qs_z_epsilon = torch.randn_like(t1_l2_qs_z_mu)
+        t1_l2_qs_z = t1_l2_qs_z_mu + torch.exp(t1_l2_qs_z_logsigma) * t1_l2_qs_z_epsilon
 
-        if optimizer_idx == 1:
-            # discriminator
-            discloss, log_dict_disc = self.loss(qloss, x, xrec, optimizer_idx, self.global_step,
-                                            last_layer=self.get_last_layer(), split="train")
-            self.log_dict(log_dict_disc, prog_bar=False, logger=True, on_step=True, on_epoch=True)
-            return discloss
+        t1_l1_qs_z_mu, t1_l1_qs_z_logsigma = self.l1_infer_z(
+            torch.cat((self.b[:, t1, :], t2_z, t1_l2_qs_z), dim=-1))
+        t1_l1_qs_z_epsilon = torch.randn_like(t1_l1_qs_z_mu)
+        t1_l1_qs_z = t1_l1_qs_z_mu + torch.exp(t1_l1_qs_z_logsigma) * t1_l1_qs_z_epsilon
 
-    def validation_step(self, batch, batch_idx):
-        log_dict = self._validation_step(batch, batch_idx)
-        with self.ema_scope():
-            log_dict_ema = self._validation_step(batch, batch_idx, suffix="_ema")
-        return log_dict
+        t1_qs_z = torch.cat((t1_l1_qs_z, t1_l2_qs_z), dim=-1)
 
-    def _validation_step(self, batch, batch_idx, suffix=""):
-        x = self.get_input(batch, self.image_key)
-        xrec, qloss, ind = self(x, return_pred_indices=True)
-        aeloss, log_dict_ae = self.loss(qloss, x, xrec, 0,
-                                        self.global_step,
-                                        last_layer=self.get_last_layer(),
-                                        split="val"+suffix,
-                                        predicted_indices=ind
-                                        )
+        #### After sampling states z from the variational distribution, we can calculate
+        #### the loss.
 
-        discloss, log_dict_disc = self.loss(qloss, x, xrec, 1,
-                                            self.global_step,
-                                            last_layer=self.get_last_layer(),
-                                            split="val"+suffix,
-                                            predicted_indices=ind
-                                            )
-        rec_loss = log_dict_ae[f"val{suffix}/rec_loss"]
-        self.log(f"val{suffix}/rec_loss", rec_loss,
-                   prog_bar=True, logger=True, on_step=False, on_epoch=True, sync_dist=True)
-        self.log(f"val{suffix}/aeloss", aeloss,
-                   prog_bar=True, logger=True, on_step=False, on_epoch=True, sync_dist=True)
-        if version.parse(pl.__version__) >= version.parse('1.4.0'):
-            del log_dict_ae[f"val{suffix}/rec_loss"]
-        self.log_dict(log_dict_ae)
-        self.log_dict(log_dict_disc)
-        return self.log_dict
+        ## state distribution at time t1 based on belief at time 1
+        t1_l2_pb_z_mu, t1_l2_pb_z_logsigma = self.l2_b_to_z(self.b[:, t1, :])
+        t1_l1_pb_z_mu, t1_l1_pb_z_logsigma = self.l1_b_to_z(
+            torch.cat((self.b[:, t1, :], t1_l2_qs_z), dim=-1))
 
-    def configure_optimizers(self):
-        lr_d = self.learning_rate
-        lr_g = self.lr_g_factor*self.learning_rate
-        print("lr_d", lr_d)
-        print("lr_g", lr_g)
-        opt_ae = torch.optim.Adam(list(self.encoder.parameters())+
-                                  list(self.decoder.parameters())+
-                                  list(self.quantize.parameters())+
-                                  list(self.quant_conv.parameters())+
-                                  list(self.post_quant_conv.parameters()),
-                                  lr=lr_g, betas=(0.5, 0.9))
-        opt_disc = torch.optim.Adam(self.loss.discriminator.parameters(),
-                                    lr=lr_d, betas=(0.5, 0.9))
+        ## state distribution at time t2 based on states at time t1 and state transition
+        t2_l2_t_z_mu, t2_l2_t_z_logsigma = self.l2_transition_z(t1_qs_z)
+        t2_l1_t_z_mu, t2_l1_t_z_logsigma = self.l1_transition_z(
+            torch.cat((t1_qs_z, t2_l2_z), dim=-1))
 
-        if self.scheduler_config is not None:
-            scheduler = instantiate_from_config(self.scheduler_config)
+        ## observation distribution at time t2 based on state at time t2
+        t2_x_prob = self.z_to_x(t2_z)
 
-            print("Setting up LambdaLR scheduler...")
-            scheduler = [
-                {
-                    'scheduler': LambdaLR(opt_ae, lr_lambda=scheduler.schedule),
-                    'interval': 'step',
-                    'frequency': 1
-                },
-                {
-                    'scheduler': LambdaLR(opt_disc, lr_lambda=scheduler.schedule),
-                    'interval': 'step',
-                    'frequency': 1
-                },
-            ]
-            return [opt_ae, opt_disc], scheduler
-        return [opt_ae, opt_disc], []
+        #### start calculating the loss
 
-    def get_last_layer(self):
-        return self.decoder.conv_out.weight
+        #### KL divergence between z distribution at time t1 based on variational distribution
+        #### (inference model) and z distribution at time t1 based on belief.
+        #### This divergence is between two normal distributions and it can be calculated analytically
 
-    def log_images(self, batch, only_inputs=False, plot_ema=False, **kwargs):
-        log = dict()
-        x = self.get_input(batch, self.image_key)
-        x = x.to(self.device)
-        if only_inputs:
-            log["inputs"] = x
-            return log
-        xrec, _ = self(x)
-        if x.shape[1] > 3:
-            # colorize with random projection
-            assert xrec.shape[1] > 3
-            x = self.to_rgb(x)
-            xrec = self.to_rgb(xrec)
-        log["inputs"] = x
-        log["reconstructions"] = xrec
-        if plot_ema:
-            with self.ema_scope():
-                xrec_ema, _ = self(x)
-                if x.shape[1] > 3: xrec_ema = self.to_rgb(xrec_ema)
-                log["reconstructions_ema"] = xrec_ema
-        return log
+        ## KL divergence between t1_l2_pb_z, and t1_l2_qs_z
+        loss = 0.5 * torch.sum(((t1_l2_pb_z_mu - t1_l2_qs_z) / torch.exp(t1_l2_pb_z_logsigma)) ** 2, -1) + \
+               torch.sum(t1_l2_pb_z_logsigma, -1) - torch.sum(t1_l2_qs_z_logsigma, -1)
 
-    def to_rgb(self, x):
-        assert self.image_key == "segmentation"
-        if not hasattr(self, "colorize"):
-            self.register_buffer("colorize", torch.randn(3, x.shape[1], 1, 1).to(x))
-        x = F.conv2d(x, weight=self.colorize)
-        x = 2.*(x-x.min())/(x.max()-x.min()) - 1.
-        return x
+        ## KL divergence between t1_l1_pb_z and t1_l1_qs_z
+        loss += 0.5 * torch.sum(((t1_l1_pb_z_mu - t1_l1_qs_z) / torch.exp(t1_l1_pb_z_logsigma)) ** 2, -1) + \
+                torch.sum(t1_l1_pb_z_logsigma, -1) - torch.sum(t1_l1_qs_z_logsigma, -1)
 
+        #### The following four terms estimate the KL divergence between the z distribution at time t2
+        #### based on variational distribution (inference model) and z distribution at time t2 based on transition.
+        #### In contrast with the above KL divergence for z distribution at time t1, this KL divergence
+        #### can not be calculated analytically because the transition distribution depends on z_t1, which is sampled
+        #### after z_t2. Therefore, the KL divergence is estimated using samples
 
-class VQModelInterface(VQModel):
-    def __init__(self, embed_dim, *args, **kwargs):
-        super().__init__(embed_dim=embed_dim, *args, **kwargs)
-        self.embed_dim = embed_dim
+        ## state log probabilty at time t2 based on belief
+        loss += torch.sum(-0.5 * t2_l2_z_epsilon ** 2 - 0.5 * t2_l2_z_epsilon.new_tensor(2 * np.pi) - t2_l2_z_logsigma,
+                          dim=-1)
+        loss += torch.sum(-0.5 * t2_l1_z_epsilon ** 2 - 0.5 * t2_l1_z_epsilon.new_tensor(2 * np.pi) - t2_l1_z_logsigma,
+                          dim=-1)
 
-    def encode(self, x):
-        h = self.encoder(x)
-        h = self.quant_conv(h)
-        return h
+        ## state log probabilty at time t2 based on transition
+        loss += torch.sum(
+            0.5 * ((t2_l2_z - t2_l2_t_z_mu) / torch.exp(t2_l2_t_z_logsigma)) ** 2 + 0.5 * t2_l2_z.new_tensor(
+                2 * np.pi) + t2_l2_t_z_logsigma, -1)
+        loss += torch.sum(
+            0.5 * ((t2_l1_z - t2_l1_t_z_mu) / torch.exp(t2_l1_t_z_logsigma)) ** 2 + 0.5 * t2_l1_z.new_tensor(
+                2 * np.pi) + t2_l1_t_z_logsigma, -1)
 
-    def decode(self, h, force_not_quantize=False):
-        # also go through quantization layer
-        if not force_not_quantize:
-            quant, emb_loss, info = self.quantize(h)
-        else:
-            quant = h
-        quant = self.post_quant_conv(quant)
-        dec = self.decoder(quant)
-        return dec
+        ## observation prob at time t2
+        loss += -torch.sum(self.x[:, t2, :] * torch.log(t2_x_prob) + (1 - self.x[:, t2, :]) * torch.log(1 - t2_x_prob),
+                           -1)
+        loss = torch.mean(loss)
 
+        return loss
 
-class AutoencoderKL(pl.LightningModule):
-    def __init__(self,
-                 ddconfig,
-                 lossconfig,
-                 embed_dim,
-                 ckpt_path=None,
-                 ignore_keys=[],
-                 image_key="image",
-                 colorize_nlabels=None,
-                 monitor=None,
-                 ):
-        super().__init__()
-        self.image_key = image_key
-        self.encoder = Encoder(**ddconfig)
-        self.decoder = Decoder(**ddconfig)
-        self.loss = instantiate_from_config(lossconfig)
-        assert ddconfig["double_z"]
-        self.quant_conv = torch.nn.Conv2d(2*ddconfig["z_channels"], 2*embed_dim, 1)
-        self.post_quant_conv = torch.nn.Conv2d(embed_dim, ddconfig["z_channels"], 1)
-        self.embed_dim = embed_dim
-        if colorize_nlabels is not None:
-            assert type(colorize_nlabels)==int
-            self.register_buffer("colorize", torch.randn(3, colorize_nlabels, 1, 1))
-        if monitor is not None:
-            self.monitor = monitor
-        if ckpt_path is not None:
-            self.init_from_ckpt(ckpt_path, ignore_keys=ignore_keys)
+    def rollout(self, images, t1, t2):
+        self.forward(images)
 
-    def init_from_ckpt(self, path, ignore_keys=list()):
-        sd = torch.load(path, map_location="cpu")["state_dict"]
-        keys = list(sd.keys())
-        for k in keys:
-            for ik in ignore_keys:
-                if k.startswith(ik):
-                    print("Deleting key {} from state_dict.".format(k))
-                    del sd[k]
-        self.load_state_dict(sd, strict=False)
-        print(f"Restored from {path}")
+        ## at time t1-1, we sample a state z based on belief at time t1-1
+        l2_z_mu, l2_z_logsigma = self.l2_b_to_z(self.b[:, t1 - 1, :])
+        l2_z_epsilon = torch.randn_like(l2_z_mu)
+        l2_z = l2_z_mu + torch.exp(l2_z_logsigma) * l2_z_epsilon
 
-    def encode(self, x):
-        h = self.encoder(x)
-        moments = self.quant_conv(h)
-        posterior = DiagonalGaussianDistribution(moments)
-        return posterior
+        l1_z_mu, l1_z_logsigma = self.l1_b_to_z(
+            torch.cat((self.b[:, t1 - 1, :], l2_z), dim=-1))
+        l1_z_epsilon = torch.randn_like(l1_z_mu)
+        l1_z = l1_z_mu + torch.exp(l1_z_logsigma) * l1_z_epsilon
+        current_z = torch.cat((l1_z, l2_z), dim=-1)
 
-    def decode(self, z):
-        z = self.post_quant_conv(z)
-        dec = self.decoder(z)
-        return dec
+        rollout_x = []
 
-    def forward(self, input, sample_posterior=True):
-        posterior = self.encode(input)
-        if sample_posterior:
-            z = posterior.sample()
-        else:
-            z = posterior.mode()
-        dec = self.decode(z)
-        return dec, posterior
+        for k in range(t2 - t1 + 1):
+            ## predicting states after time t1 using state transition
+            next_l2_z_mu, next_l2_z_logsigma = self.l2_transition_z(current_z)
+            next_l2_z_epsilon = torch.randn_like(next_l2_z_mu)
+            next_l2_z = next_l2_z_mu + torch.exp(next_l2_z_logsigma) * next_l2_z_epsilon
 
-    def get_input(self, batch, k):
-        x = batch[k]
-        if len(x.shape) == 3:
-            x = x[..., None]
-        x = x.permute(0, 3, 1, 2).to(memory_format=torch.contiguous_format).float()
-        return x
+            next_l1_z_mu, next_l1_z_logsigma = self.l1_transition_z(
+                torch.cat((current_z, next_l2_z), dim=-1))
+            next_l1_z_epsilon = torch.randn_like(next_l1_z_mu)
+            next_l1_z = next_l1_z_mu + torch.exp(next_l1_z_logsigma) * next_l1_z_epsilon
+            next_z = torch.cat((next_l1_z, next_l2_z), dim=-1)
 
-    def training_step(self, batch, batch_idx, optimizer_idx):
-        inputs = self.get_input(batch, self.image_key)
-        reconstructions, posterior = self(inputs)
+            ## generate an observation x_t1 at time t1 based on sampled state z_t1
+            next_x = self.z_to_x(next_z)
+            rollout_x.append(next_x)
 
-        if optimizer_idx == 0:
-            # train encoder+decoder+logvar
-            aeloss, log_dict_ae = self.loss(inputs, reconstructions, posterior, optimizer_idx, self.global_step,
-                                            last_layer=self.get_last_layer(), split="train")
-            self.log("aeloss", aeloss, prog_bar=True, logger=True, on_step=True, on_epoch=True)
-            self.log_dict(log_dict_ae, prog_bar=False, logger=True, on_step=True, on_epoch=False)
-            return aeloss
+            current_z = next_z
 
-        if optimizer_idx == 1:
-            # train the discriminator
-            discloss, log_dict_disc = self.loss(inputs, reconstructions, posterior, optimizer_idx, self.global_step,
-                                                last_layer=self.get_last_layer(), split="train")
+        rollout_x = torch.stack(rollout_x, dim=1)
 
-            self.log("discloss", discloss, prog_bar=True, logger=True, on_step=True, on_epoch=True)
-            self.log_dict(log_dict_disc, prog_bar=False, logger=True, on_step=True, on_epoch=False)
-            return discloss
+        return rollout_x
 
-    def validation_step(self, batch, batch_idx):
-        inputs = self.get_input(batch, self.image_key)
-        reconstructions, posterior = self(inputs)
-        aeloss, log_dict_ae = self.loss(inputs, reconstructions, posterior, 0, self.global_step,
-                                        last_layer=self.get_last_layer(), split="val")
+    def get_input(self, batch):
+        x = batch[self.batch_key]
+        x = rearrange(x, 'B T P C -> B T (P C)')    # p代表人脸landmark的特征点（point）
+        x_c = batch[self.condition_key]
+        x_c = rearrange(x_c, "B T C -> B C T")
+        x_c = self.c_encode(x_c)
+        x_c = rearrange(x_c, "B C T -> B T C")
+        return x, x_c
 
-        discloss, log_dict_disc = self.loss(inputs, reconstructions, posterior, 1, self.global_step,
-                                            last_layer=self.get_last_layer(), split="val")
-
-        self.log("val/rec_loss", log_dict_ae["val/rec_loss"])
-        self.log_dict(log_dict_ae)
-        self.log_dict(log_dict_disc)
-        return self.log_dict
+    def training_step(self, batch, batch_idx):      # ,optimizer_idx): 这个optimizer是个啥没搞懂，全程没看见它从哪进的
+        lms, hubert = self.get_input(batch)
+        self(lms, hubert)
+        t_1 = np.random.choice(16)
+        t_2 = t_1 + np.random.choice([1, 2, 3, 4])
+        loss = self.calculate_loss(t_1, t_2)
+        return loss
 
     def configure_optimizers(self):
         lr = self.learning_rate
-        opt_ae = torch.optim.Adam(list(self.encoder.parameters())+
-                                  list(self.decoder.parameters())+
-                                  list(self.quant_conv.parameters())+
-                                  list(self.post_quant_conv.parameters()),
+        opt_ae = torch.optim.Adam(self.parameters(),
                                   lr=lr, betas=(0.5, 0.9))
-        opt_disc = torch.optim.Adam(self.loss.discriminator.parameters(),
-                                    lr=lr, betas=(0.5, 0.9))
-        return [opt_ae, opt_disc], []
-
-    def get_last_layer(self):
-        return self.decoder.conv_out.weight
-
-    @torch.no_grad()
-    def log_images(self, batch, only_inputs=False, **kwargs):
-        log = dict()
-        x = self.get_input(batch, self.image_key)
-        x = x.to(self.device)
-        if not only_inputs:
-            xrec, posterior = self(x)
-            if x.shape[1] > 3:
-                # colorize with random projection
-                assert xrec.shape[1] > 3
-                x = self.to_rgb(x)
-                xrec = self.to_rgb(xrec)
-            log["samples"] = self.decode(torch.randn_like(posterior.sample()))
-            log["reconstructions"] = xrec
-        log["inputs"] = x
-        return log
-
-    def to_rgb(self, x):
-        assert self.image_key == "segmentation"
-        if not hasattr(self, "colorize"):
-            self.register_buffer("colorize", torch.randn(3, x.shape[1], 1, 1).to(x))
-        x = F.conv2d(x, weight=self.colorize)
-        x = 2.*(x-x.min())/(x.max()-x.min()) - 1.
-        return x
+        # opt_disc = torch.optim.Adam(self.loss.discriminator.parameters(),
+        #                             lr=lr, betas=(0.5, 0.9))
+        # return [opt_ae, opt_disc], []
+        return [opt_ae], []
 
 
-class IdentityFirstStage(torch.nn.Module):
-    def __init__(self, *args, vq_interface=False, **kwargs):
-        self.vq_interface = vq_interface  # TODO: Should be true by default but check to not break older stuff
-        super().__init__()
-
-    def encode(self, x, *args, **kwargs):
-        return x
-
-    def decode(self, x, *args, **kwargs):
-        return x
-
-    def quantize(self, x, *args, **kwargs):
-        if self.vq_interface:
-            return x, None, [None, None, None]
-        return x
-
-    def forward(self, x, *args, **kwargs):
-        return x

@@ -144,7 +144,7 @@ class TD_VAE(nn.Module):
         ## sample a state at time t2 (see the reparametralization trick is used)
         ## z in layer 2
         t2_l2_z_mu, t2_l2_z_logsigma = self.l2_b_to_z(self.b[:, t2, :])
-        t2_l2_z_epsilon = torch.randn_like(t2_l2_z_mu)
+        t2_l2_z_epsilon = torch.randn_like(t2_l2_z_mu)      # 返回一个与均值张量相同尺寸的矩阵，元素为由标准正态分布采样出来的值
         t2_l2_z = t2_l2_z_mu + torch.exp(t2_l2_z_logsigma)*t2_l2_z_epsilon
 
         ## z in layer 1
@@ -247,7 +247,6 @@ class TD_VAE(nn.Module):
                 torch.cat((current_z, next_l2_z), dim = -1))
             next_l1_z_epsilon = torch.randn_like(next_l1_z_mu)        
             next_l1_z = next_l1_z_mu + torch.exp(next_l1_z_logsigma)*next_l1_z_epsilon
-
             next_z = torch.cat((next_l1_z, next_l2_z), dim = -1)
 
             ## generate an observation x_t1 at time t1 based on sampled state z_t1

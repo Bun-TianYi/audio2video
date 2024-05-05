@@ -164,6 +164,10 @@ def collate_init_fn(datas):
     datas.sort(key=lambda x: len(x['video']), reverse=True)
     video_pad_num = len(datas[0]['video'])
     hubert_pad_num = len(datas[0]['hubert'])
+    if video_pad_num*2 - hubert_pad_num > 0:
+        hubert_pad_num = hubert_pad_num + 1
+    elif video_pad_num *2 -hubert_pad_num < 0:
+        hubert_pad_num = hubert_pad_num - 1
     data_copy = {}
     data_video_temp = []
     data_lms_temp = []
