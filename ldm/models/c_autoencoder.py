@@ -147,6 +147,9 @@ class TD_VAE(pl.LightningModule):
         self.lstm = nn.LSTM(input_size=self.processed_x_size,
                             hidden_size=self.b_size,
                             batch_first=True)
+        self.c_lstm = nn.LSTM(input_size=1024,
+                              hidden_size=self.b_size,
+                              batch_first=True)
 
         ## Two layer state model is used. Sampling is done by sampling
         ## higher layer first.
@@ -177,6 +180,9 @@ class TD_VAE(pl.LightningModule):
 
         ## aggregate the belief b
         self.b, (h_n, c_n) = self.lstm(self.processed_x)
+        self.c_b, (_, _) = self.c_lstm(condition)
+
+        pp = 0
 
     def calculate_loss(self, t1, t2):
         """ Calculate the jumpy VD-VAE loss, which is corresponding to
